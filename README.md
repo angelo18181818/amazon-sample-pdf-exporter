@@ -1,78 +1,78 @@
 # Amazon Sample PDF Exporter
 
-Userscript per Tampermonkey che aggiunge un pulsante di download alle pagine Amazon con **Read Sample / Leggi estratto** e crea un PDF dalle immagini del sample.
+A Tampermonkey userscript that adds a download button to Amazon pages with **Read Sample** and exports the loaded sample pages as a PDF.
 
-Testato su:
+Tested on:
 
 - Google Chrome
 - Mozilla Firefox
 
-> Nota: su Chrome serve abilitare manualmente l'esecuzione degli userscript nelle impostazioni dell'estensione.
+> Note: on Chrome, you must manually enable user scripts in the extension settings.
 
-## Funzioni
+## Features
 
-- Pulsante dedicato vicino a **Read Sample**
-- Esportazione del sample Amazon in PDF
-- Avanzamento percentuale dentro il pulsante
-- Scroll automatico del reader per caricare le pagine
-- Chiusura automatica del reader al termine del processo
-- Pulizia delle immagini gia caricate da aperture manuali precedenti del sample
+- Dedicated PDF button next to **Read Sample**
+- Exports Amazon sample pages to PDF
+- Inline progress percentage inside the button
+- Automatic reader scrolling to load pages
+- Automatic reader cleanup at the end of the process
+- Clears previously loaded sample images from manual reader sessions
 
-## Installazione
+## Installation
 
-1. Installa Tampermonkey:
+1. Install Tampermonkey:
    - Chrome: https://www.tampermonkey.net/?browser=chrome
    - Firefox: https://www.tampermonkey.net/?browser=firefox
-2. Apri il file `amazon-sample-pdf-exporter-progress.user.js` su GitHub.
-3. Clicca **Raw**.
-4. Tampermonkey dovrebbe aprire automaticamente la schermata di installazione.
-5. Clicca **Install**.
+2. Open `amazon-sample-pdf-exporter-progress.user.js` on GitHub.
+3. Click **Raw**.
+4. Tampermonkey should automatically open the script installation page.
+5. Click **Install**.
 
-## Configurazione su Chrome
+## Chrome Setup
 
-Chrome puo bloccare gli userscript finche non abiliti il permesso corretto.
+Chrome may block user scripts until the proper permission is enabled.
 
-Fai cosi:
+Do this:
 
-1. Apri `chrome://extensions`
-2. Attiva **Modalita sviluppatore**
-3. Trova **Tampermonkey**
-4. Clicca **Dettagli**
-5. Attiva **Permetti scripts utente** / **Allow user scripts**
-6. Ricarica la pagina Amazon
+1. Open `chrome://extensions`
+2. Enable **Developer mode**
+3. Find **Tampermonkey**
+4. Click **Details**
+5. Enable **Allow user scripts**
+6. Reload the Amazon page
 
-Alla prima esportazione Chrome o Tampermonkey potrebbe chiedere anche il permesso per scaricare file. Accetta il permesso di download, altrimenti il PDF potrebbe essere generato ma non salvato correttamente.
+On the first export, Chrome or Tampermonkey may also ask for permission to download files. Allow downloads, otherwise the PDF may be generated but not saved correctly.
 
-## Configurazione su Firefox
+## Firefox Setup
 
-Su Firefox di solito basta installare Tampermonkey e poi installare lo script dal pulsante **Raw** di GitHub.
+On Firefox, installing Tampermonkey and then installing the script from GitHub's **Raw** button is usually enough.
 
-Se il download non parte:
+If the download does not start:
 
-1. Controlla che Tampermonkey sia attivo.
-2. Controlla che lo script sia abilitato nella dashboard di Tampermonkey.
-3. Ricarica la pagina Amazon.
+1. Make sure Tampermonkey is enabled.
+2. Make sure the script is enabled in the Tampermonkey dashboard.
+3. Reload the Amazon page.
 
-## Uso
+## Usage
 
-1. Apri una pagina Amazon che contiene **Read Sample** o **Leggi estratto**.
-2. Aspetta che la pagina sia caricata.
-3. Clicca il pulsante dorato del PDF.
-4. Lascia lavorare lo script fino al completamento.
-5. Salva il PDF quando il browser lo richiede.
+1. Open an Amazon page that contains **Read Sample**.
+2. Wait for the page to fully load.
+3. Click the gold PDF button.
+4. Let the script run until completion.
+5. Save the PDF when the browser asks.
 
-## Note
+## Notes
 
-- Lo script funziona solo sui sample accessibili tramite Amazon Read Sample.
-- Non modifica il contenuto del libro: raccoglie le immagini gia caricate dal reader del sample.
-- Usa lo script solo per contenuti che hai il diritto di visualizzare e nel rispetto dei termini di Amazon e del copyright.
+- The script only works on samples available through Amazon Read Sample.
+- It does not modify the book content: it collects the images already loaded by the sample reader.
+- Use this script only for content you are allowed to view and in accordance with Amazon's terms and copyright law.
 
-## File principale
+## Main File
 
 `amazon-sample-pdf-exporter-progress.user.js`
 
-Versione attuale: `2.8.3`
+Current version: `2.8.2`
 
-## Licenza
+## License
 
 MIT
