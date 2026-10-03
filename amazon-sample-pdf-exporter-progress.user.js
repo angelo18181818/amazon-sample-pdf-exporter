@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Amazon Sample PDF Exporter
 // @namespace    https://local.userscripts.amazon-sample-pdf-exporter
-// @version      2.8.2
+// @version      2.10.5
 // @description  Adds a luxury PDF export button with inline progress to Amazon sample pages and exports the loaded sample images as a single PDF.
 // @author       Local User
 // @license      MIT
@@ -13,6 +13,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_deleteValue
+// @grant        unsafeWindow
 // @connect      *.cloudfront.net
 // @connect      cloudfront.net
 // ==/UserScript==
@@ -35,6 +36,14 @@
   const ARM_READER_MESSAGE_TYPE = "amazonSamplePdfArmReaderFromButton";
   const DOWNLOAD_SETTLE_MS = 1500;
   const PAGE_COMPLETE_SETTLE_MS = 250;
+  const AUTO_ADVANCE_INTERVAL_MS = 700;
+  const VERTICAL_SCROLL_STEP_RATIO = 0.35;
+  const PAGINATED_PAGE_TIMEOUT_MS = 15000;
+  const PAGINATED_CAPTURE_RETRIES = 3;
+  const SHOW_READER_DURING_EXPORT = false;
+  const SHOW_READER_STATUS = false;
+  const KEEP_READER_OPEN_ON_FAILURE = true;
+  const READER_STATUS_ID = "amazon-sample-pdf-reader-status";
 
   const VIEWER_SELECTORS = [
     ".litb-content-background",
@@ -70,6 +79,7 @@
   let autoScrollDone = false;
   let lastScrollTop = -1;
   let stableScrollTicks = 0;
+  let readerAdvanceMode = "unknown";
   let progressPercent = 0;
   let exportStartedByButton = false;
 
@@ -283,6 +293,11 @@
   }
 
   function applyHiddenReaderStyle() {
+    if (SHOW_READER_DURING_EXPORT) {
+      removeHiddenReaderStyle();
+      return;
+    }
+
     if (document.getElementById(HIDDEN_READER_STYLE_ID)) return;
 
     const style = document.createElement("style");
@@ -330,6 +345,49 @@
 
   function removeHiddenReaderStyle() {
     document.getElementById(HIDDEN_READER_STYLE_ID)?.remove();
+  }
+
+  function setReaderStatus(message, tone = "working") {
+    if (!SHOW_READER_STATUS) {
+      document.getElementById(READER_STATUS_ID)?.remove();
+      return;
+    }
+
+    if (!isReaderContext() || !document.documentElement) return;
+
+    let status = document.getElementById(READER_STATUS_ID);
+
+    if (!status) {
+      status = document.createElement("div");
+      status.id = READER_STATUS_ID;
+      status.setAttribute("role", "status");
+      status.style.cssText = [
+        "position:fixed",
+        "top:12px",
+        "left:50%",
+        "transform:translateX(-50%)",
+        "z-index:2147483647",
+        "max-width:min(720px,calc(100vw - 32px))",
+        "padding:9px 14px",
+        "border:1px solid rgba(255,255,255,.42)",
+        "border-radius:999px",
+        "box-shadow:0 8px 24px rgba(0,0,0,.32)",
+        "color:#fff",
+        "font:700 13px/1.35 Arial,sans-serif",
+        "text-align:center",
+        "pointer-events:none"
+      ].join(";");
+      document.documentElement.appendChild(status);
+    }
+
+    const backgrounds = {
+      error: "rgba(153,27,27,.94)",
+      success: "rgba(6,95,70,.94)",
+      working: "rgba(17,24,39,.94)"
+    };
+
+    status.style.background = backgrounds[tone] || backgrounds.working;
+    status.textContent = `Amazon PDF: ${message}`;
   }
 
   function createExportIcon() {
@@ -582,6 +640,7 @@
       autoScrollDone = false;
       lastScrollTop = -1;
       stableScrollTicks = 0;
+      readerAdvanceMode = "unknown";
       progressPercent = 0;
       clearInterval(scrollTimer);
       scrollTimer = null;
@@ -666,13 +725,105 @@
     return match ? parseInt(match[1], 36) : Number.MAX_SAFE_INTEGER;
   }
 
+  function targetImageKey(url) {
+    try {
+      const parsed = new URL(url);
+      return `${parsed.hostname.toLowerCase()}${parsed.pathname.toLowerCase()}`;
+    } catch {
+      return url;
+    }
+  }
+
+  function signedUrlExpiry(url) {
+    try {
+      return Number(new URL(url).searchParams.get("Expires")) || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  function imageElementToDataUrl(img) {
+    return new Promise((resolve, reject) => {
+      const capture = () => {
+        try {
+          const width = img.naturalWidth || img.width;
+          const height = img.naturalHeight || img.height;
+
+          if (!width || !height) {
+            reject(new Error("The blob image has no rendered dimensions."));
+            return;
+          }
+
+          const canvas = document.createElement("canvas");
+          canvas.width = width;
+          canvas.height = height;
+
+          const context = canvas.getContext("2d");
+          if (!context) {
+            reject(new Error("Canvas 2D is not available."));
+            return;
+          }
+
+          context.drawImage(img, 0, 0, width, height);
+          resolve(canvas.toDataURL("image/png"));
+        } catch (error) {
+          reject(error);
+        }
+      };
+
+      if (img.complete && (img.naturalWidth || img.width)) {
+        capture();
+        return;
+      }
+
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error("Timed out waiting for the blob image to load."));
+      }, 5000);
+
+      const cleanup = () => {
+        clearTimeout(timeout);
+        img.removeEventListener("load", onLoad);
+        img.removeEventListener("error", onError);
+      };
+      const onLoad = () => {
+        cleanup();
+        capture();
+      };
+      const onError = () => {
+        cleanup();
+        reject(new Error("The blob image failed to load."));
+      };
+
+      img.addEventListener("load", onLoad, { once: true });
+      img.addEventListener("error", onError, { once: true });
+    });
+  }
+
   function addUrl(value, source) {
     if (!isExportArmed()) return;
 
-    const url = normalizeTargetUrl(value);
-    if (!url || found.has(url)) return;
+    const raw = cleanUrl(value);
 
-    found.set(url, {
+    if (/^blob:https?:\/\//i.test(raw)) {
+      return;
+    }
+
+    const url = normalizeTargetUrl(raw);
+    if (!url) return;
+
+    const key = targetImageKey(url);
+    const existing = found.get(key);
+
+    if (existing) {
+      if (signedUrlExpiry(url) > signedUrlExpiry(existing.url)) {
+        existing.source = source;
+        existing.url = url;
+      }
+      return;
+    }
+
+    found.set(key, {
       page: pageFromUrl(url),
       source,
       url
@@ -750,6 +901,395 @@
     element.scrollTop = value;
   }
 
+  function detectReaderAdvanceMode() {
+    const readingArea = document.querySelector(".litb-reading-area");
+
+    if (
+      readingArea?.classList.contains("paginated") ||
+      document.querySelector("#kr-chevron-right, button[aria-label='Next page'], button[title='Next page']")
+    ) {
+      return "paginated";
+    }
+
+    if (readingArea?.classList.contains("scroll")) {
+      return "vertical";
+    }
+
+    return "waiting";
+  }
+
+  function findNextPageButton() {
+    return (
+      document.querySelector("#kr-chevron-right") ||
+      document.querySelector("button[aria-label='Next page']") ||
+      document.querySelector("button[title='Next page']") ||
+      [...document.querySelectorAll("button")].find(button =>
+        /next page|pagina successiva|pagina seguente/i.test(
+          `${button.getAttribute("aria-label") || ""} ${button.title || ""}`
+        )
+      )
+    );
+  }
+
+  function controlIsDisabled(control) {
+    return Boolean(
+      control && (
+        control.disabled ||
+        control.getAttribute("aria-disabled") === "true" ||
+        control.hidden
+      )
+    );
+  }
+
+  function sampleProgressPercent() {
+    const scrubber = document.querySelector("#kr-scrubber-bar, ion-range[aria-label*='sample']");
+    const candidates = [
+      scrubber?.getAttribute("aria-label"),
+      document.querySelector(".reading-loc-percent")?.textContent,
+      document.querySelector(".range-pin")?.textContent
+    ].filter(Boolean);
+
+    for (const candidate of candidates) {
+      const match = String(candidate).match(/(\d+(?:[.,]\d+)?)\s*%/);
+      if (!match) continue;
+
+      const value = Number(match[1].replace(",", "."));
+      if (Number.isFinite(value)) {
+        return Math.max(0, Math.min(100, value));
+      }
+    }
+
+    const rawValue = Number(scrubber?.value ?? scrubber?.getAttribute("value"));
+    const rawMax = Number(scrubber?.max ?? scrubber?.getAttribute("max"));
+
+    if (Number.isFinite(rawValue) && Number.isFinite(rawMax) && rawMax > 0) {
+      return Math.max(0, Math.min(100, (rawValue / rawMax) * 100));
+    }
+
+    return null;
+  }
+
+  function sampleProgressIsComplete() {
+    const percent = sampleProgressPercent();
+    return percent !== null && percent >= 100;
+  }
+
+  function paginatedEndIsVisible() {
+    return [...document.querySelectorAll(".paginated-end-actions")].some(element => {
+      if (element.classList.contains("paginated-end-actions-hide")) return false;
+
+      const style = getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    });
+  }
+
+  function paginatedPageSignature() {
+    const renderer = document.querySelector("#kr-renderer");
+    if (!renderer) return "";
+
+    const imageSources = [...renderer.querySelectorAll("img")]
+      .map(image => image.currentSrc || image.src || image.getAttribute("src") || "")
+      .join("|");
+    const pageNumbers = [...renderer.querySelectorAll("[data-page]")]
+      .map(element => element.getAttribute("data-page") || "")
+      .join("|");
+    const locationText = document.querySelector(".range-pin, .reading-loc-percent")
+      ?.textContent?.replace(/\s+/g, " ").trim() || "";
+    const accessiblePageText = renderer.querySelector('[role="region"][aria-label="page"]')
+      ?.textContent?.replace(/\s+/g, " ").trim().slice(0, 320) || "";
+
+    return [imageSources, pageNumbers, locationText, accessiblePageText].join("::");
+  }
+
+  function readerPageWindow() {
+    try {
+      if (typeof unsafeWindow !== "undefined" && unsafeWindow) {
+        return unsafeWindow;
+      }
+
+      if (window.wrappedJSObject) {
+        return window.wrappedJSObject;
+      }
+    } catch (error) {
+      console.debug(`${LOG_PREFIX} Unable to access the raw reader window.`, error);
+    }
+
+    return window;
+  }
+
+  function clickNextPage() {
+    const pageWindow = readerPageWindow();
+    const pageDocument = pageWindow.document || document;
+    const pageButton = pageDocument.getElementById("kr-chevron-right");
+
+    if (!pageButton) {
+      throw new Error("#kr-chevron-right non trovato nel documento interno dell’iframe.");
+    }
+
+    const pageContainer = pageButton.closest(".kr-chevron-container-right") ||
+      pageDocument.querySelector(".kr-chevron-container-right");
+
+    if (!pageContainer) {
+      throw new Error("Il contenitore .kr-chevron-container-right non è stato trovato.");
+    }
+
+    const rect = pageContainer.getBoundingClientRect();
+    const clientX = rect.left + rect.width / 2;
+    const clientY = rect.top + rect.height / 2;
+    const MouseEventCtor = pageWindow.MouseEvent || MouseEvent;
+    const dispatchEvent = pageWindow.EventTarget?.prototype?.dispatchEvent;
+
+    const mouseDown = new MouseEventCtor("mousedown", {
+      bubbles: true,
+      button: 0,
+      buttons: 1,
+      cancelable: true,
+      clientX,
+      clientY,
+      view: pageWindow
+    });
+    const mouseUp = new MouseEventCtor("mouseup", {
+      bubbles: true,
+      button: 0,
+      buttons: 0,
+      cancelable: true,
+      clientX,
+      clientY,
+      view: pageWindow
+    });
+
+    if (typeof dispatchEvent === "function") {
+      dispatchEvent.call(pageContainer, mouseDown);
+      dispatchEvent.call(pageContainer, mouseUp);
+    } else {
+      pageContainer.dispatchEvent(mouseDown);
+      pageContainer.dispatchEvent(mouseUp);
+    }
+
+    return "iframe right-container mousedown+mouseup";
+  }
+
+  function wait(milliseconds) {
+    return new Promise(resolve => setTimeout(resolve, milliseconds));
+  }
+
+  function currentPaginatedImage() {
+    const renderer = document.querySelector("#kr-renderer");
+    if (!renderer) return null;
+
+    const candidates = [
+      ...renderer.querySelectorAll(".kg-full-page-img img, img[src^='blob:'], img")
+    ];
+
+    return candidates.find(image =>
+      image.complete &&
+      (image.naturalWidth || image.width) > 0 &&
+      (image.naturalHeight || image.height) > 0
+    ) || null;
+  }
+
+  async function waitForPaginatedPage(previousSignature = "") {
+    const deadline = Date.now() + PAGINATED_PAGE_TIMEOUT_MS;
+
+    while (!stopped && isExportArmed() && Date.now() < deadline) {
+      if (paginatedEndIsVisible()) {
+        return { end: true };
+      }
+
+      const image = currentPaginatedImage();
+      const signature = paginatedPageSignature();
+
+      if (image && signature && signature !== previousSignature) {
+        return {
+          end: false,
+          image,
+          signature
+        };
+      }
+
+      await wait(120);
+    }
+
+    return null;
+  }
+
+  async function saveCurrentPaginatedPage(pageState, pageNumber) {
+    let lastError = null;
+
+    for (let attempt = 1; attempt <= PAGINATED_CAPTURE_RETRIES; attempt += 1) {
+      try {
+        const image = currentPaginatedImage() || pageState.image;
+        const dataUrl = await imageElementToDataUrl(image);
+
+        if (!/^data:image\//i.test(dataUrl) || dataUrl.length < 512) {
+          throw new Error("The captured page image is empty.");
+        }
+
+        const sourceUrl = image.currentSrc || image.src || image.getAttribute("src") || "";
+        const key = `kindle-page-${pageNumber}-${pageState.signature}`;
+
+        found.set(key, {
+          dataUrl,
+          page: pageNumber,
+          source: "kindle.visible-page",
+          url: sourceUrl
+        });
+
+        setReaderStatus(`Kindle: pagina ${pageNumber} salvata`);
+        setExportProgressAtLeast(Math.min(45, 16 + pageNumber * 1.5));
+        extendArm();
+        return;
+      } catch (error) {
+        lastError = error;
+        console.warn(
+          `${LOG_PREFIX} Kindle page ${pageNumber} capture attempt ${attempt} failed.`,
+          error
+        );
+
+        if (attempt < PAGINATED_CAPTURE_RETRIES) {
+          await wait(350);
+        }
+      }
+    }
+
+    throw lastError || new Error(`Unable to capture Kindle page ${pageNumber}.`);
+  }
+
+  async function runPaginatedReader() {
+    let previousSignature = "";
+    let savedPages = 0;
+    let completed = false;
+
+    while (!stopped && isExportArmed()) {
+      setReaderStatus(
+        savedPages === 0
+          ? "Kindle: attendo la prima pagina..."
+          : `Kindle: attendo la pagina ${savedPages + 1}...`
+      );
+
+      const pageState = await waitForPaginatedPage(previousSignature);
+
+      if (!pageState) {
+        throw new Error("La pagina Kindle successiva non è comparsa entro il tempo previsto.");
+      }
+
+      if (pageState.end) {
+        completed = true;
+        break;
+      }
+
+      const pageNumber = savedPages + 1;
+      setReaderStatus(`Kindle: salvataggio della pagina ${pageNumber}...`);
+      await saveCurrentPaginatedPage(pageState, pageNumber);
+
+      savedPages = pageNumber;
+      previousSignature = pageState.signature;
+      scanPerformance();
+
+      const progressPercent = sampleProgressPercent();
+      if (progressPercent !== null) {
+        setReaderStatus(
+          `Kindle: pagina ${pageNumber} salvata; sample ${Math.round(progressPercent)}%`
+        );
+      }
+
+      if (sampleProgressIsComplete()) {
+        completed = true;
+        break;
+      }
+
+      const nextButton = document.querySelector("#kr-chevron-right");
+
+      if (paginatedEndIsVisible()) {
+        completed = true;
+        break;
+      }
+
+      if (!nextButton) {
+        throw new Error("#kr-chevron-right è scomparso prima del 100% del sample.");
+      }
+
+      if (controlIsDisabled(nextButton)) {
+        throw new Error("#kr-chevron-right è disabilitato prima del 100% del sample.");
+      }
+
+      await wait(250);
+      setReaderStatus(`Kindle: attivazione di Next page dopo la pagina ${pageNumber}`);
+      const clickMethod = clickNextPage();
+      console.log(
+        `${LOG_PREFIX} Next page activated after saved page ${pageNumber}. Method: ${clickMethod}.`
+      );
+    }
+
+    if (!completed) {
+      throw new Error("Il ciclo Kindle si è interrotto prima del 100% del sample.");
+    }
+
+    finishAutoAdvance();
+  }
+
+  function advanceVerticalReader(state, ticks) {
+    const target = getScrollTarget();
+
+    if (target !== state.lastElement) {
+      state.lastElement = target;
+      lastScrollTop = -1;
+      stableScrollTicks = 0;
+    }
+
+    const currentTop = getScrollTop(target);
+    const maxTop = Math.max(0, target.scrollHeight - target.clientHeight);
+    const viewportHeight = target.clientHeight || window.innerHeight || 800;
+    const step = Math.max(180, Math.floor(viewportHeight * VERTICAL_SCROLL_STEP_RATIO));
+    const nextTop = Math.min(maxTop, currentTop + step);
+
+    setScrollTop(target, nextTop);
+    target.dispatchEvent(new Event("scroll", { bubbles: true }));
+    window.dispatchEvent(new Event("scroll"));
+
+    const afterTop = getScrollTop(target);
+    const atBottom = maxTop > 0 && afterTop >= maxTop - 8;
+    const didNotMove = Math.abs(afterTop - lastScrollTop) < 4;
+
+    if (maxTop <= 8 && found.size === 0 && ticks < SCROLL_READY_WAIT_TICKS) {
+      setExportProgressAtLeast(Math.min(20, 8 + (ticks / SCROLL_READY_WAIT_TICKS) * 12));
+      stableScrollTicks = 0;
+      lastScrollTop = afterTop;
+      return false;
+    }
+
+    if (maxTop > 8) {
+      const scrollRatio = Math.max(0, Math.min(1, afterTop / maxTop));
+      const foundBonus = Math.min(8, found.size * 1.5);
+      setReaderStatus(`Paperback: scorrimento verticale ${Math.round(scrollRatio * 100)}%`);
+      setExportProgressAtLeast(Math.min(45, 20 + scrollRatio * 17 + foundBonus));
+    }
+
+    stableScrollTicks = didNotMove || atBottom ? stableScrollTicks + 1 : 0;
+    lastScrollTop = afterTop;
+
+    return stableScrollTicks >= 5 || ticks >= 240;
+  }
+
+  function finishAutoAdvance() {
+    clearInterval(scrollTimer);
+    scrollTimer = null;
+    autoScrolling = false;
+    autoScrollDone = true;
+
+    scanDom();
+    scanPerformance();
+    setExportProgressAtLeast(46);
+    resetIdleTimer();
+    setReaderStatus(`avanzamento terminato; immagini rilevate: ${found.size}`);
+
+    console.log(
+      `${LOG_PREFIX} Automatic ${readerAdvanceMode} advance completed. Images seen so far:`,
+      found.size
+    );
+  }
+
   function startAutoScroll() {
     if (autoScrolling || autoScrollDone) return;
 
@@ -757,9 +1297,12 @@
     autoScrollDone = false;
     lastScrollTop = -1;
     stableScrollTicks = 0;
+    readerAdvanceMode = "unknown";
 
     let ticks = 0;
-    let lastScrollElement = null;
+    const verticalState = {
+      lastElement: null
+    };
 
     clearTimeout(idleTimer);
     clearInterval(scrollTimer);
@@ -772,62 +1315,51 @@
         return;
       }
 
-      const target = getScrollTarget();
-
-      if (target !== lastScrollElement) {
-        lastScrollElement = target;
-        lastScrollTop = -1;
-        stableScrollTicks = 0;
-      }
-
-      const currentTop = getScrollTop(target);
-      const maxTop = Math.max(0, target.scrollHeight - target.clientHeight);
-      const step = Math.max(420, Math.floor((target.clientHeight || window.innerHeight || 800) * 0.82));
-      const nextTop = Math.min(maxTop, currentTop + step);
-
-      setScrollTop(target, nextTop);
-      target.dispatchEvent(new Event("scroll", { bubbles: true }));
-      window.dispatchEvent(new Event("scroll"));
-
       scanDom();
       scanPerformance();
-
-      const afterTop = getScrollTop(target);
-      const atBottom = maxTop > 0 && afterTop >= maxTop - 8;
-      const didNotMove = Math.abs(afterTop - lastScrollTop) < 4;
-
       ticks += 1;
 
-      if (maxTop <= 8 && found.size === 0 && ticks < SCROLL_READY_WAIT_TICKS) {
-        setExportProgressAtLeast(Math.min(20, 8 + (ticks / SCROLL_READY_WAIT_TICKS) * 12));
-        stableScrollTicks = 0;
-        lastScrollTop = afterTop;
-        return;
+      if (readerAdvanceMode === "unknown") {
+        const detectedMode = detectReaderAdvanceMode();
+
+        if (detectedMode === "waiting") {
+          setExportProgressAtLeast(Math.min(16, 8 + (ticks / SCROLL_READY_WAIT_TICKS) * 8));
+          if (ticks < SCROLL_READY_WAIT_TICKS) return;
+          readerAdvanceMode = "vertical";
+        } else {
+          readerAdvanceMode = detectedMode;
+          setReaderStatus(
+            readerAdvanceMode === "paginated"
+              ? "Kindle rilevato; avanzamento pagina per pagina"
+              : "Paperback rilevato; scorrimento verticale"
+          );
+          console.log(`${LOG_PREFIX} Reader navigation detected: ${readerAdvanceMode}.`);
+
+          if (readerAdvanceMode === "paginated") {
+            clearInterval(scrollTimer);
+            scrollTimer = null;
+
+            runPaginatedReader().catch(error => {
+              console.error(`${LOG_PREFIX} Sequential Kindle export failed.`, error);
+              stopCollectors();
+              clearArm();
+              setExportButtonBusy(false);
+              setReaderStatus(
+                `Kindle interrotto: ${error.message || error}`,
+                "error"
+              );
+            });
+            return;
+          }
+        }
       }
 
-      if (maxTop > 8) {
-        const scrollRatio = Math.max(0, Math.min(1, afterTop / maxTop));
-        const foundBonus = Math.min(8, found.size * 1.5);
-        setExportProgressAtLeast(Math.min(45, 20 + scrollRatio * 17 + foundBonus));
+      const finished = advanceVerticalReader(verticalState, ticks);
+
+      if (finished) {
+        finishAutoAdvance();
       }
-
-      stableScrollTicks = didNotMove || atBottom ? stableScrollTicks + 1 : 0;
-      lastScrollTop = afterTop;
-
-      if (stableScrollTicks < 5 && ticks < 240) return;
-
-      clearInterval(scrollTimer);
-      scrollTimer = null;
-      autoScrolling = false;
-      autoScrollDone = true;
-
-      scanDom();
-      scanPerformance();
-      setExportProgressAtLeast(46);
-      resetIdleTimer();
-
-      console.log(`${LOG_PREFIX} Auto-scroll completed. Images seen so far:`, found.size);
-    }, 450);
+    }, AUTO_ADVANCE_INTERVAL_MS);
   }
 
   function viewerIsOpen() {
@@ -845,7 +1377,15 @@
       setExportProgressAtLeast(48);
       stopAndBuildPdf("No new image URLs for 3 seconds").catch(async error => {
         console.error(`${LOG_PREFIX} Export failed.`, error);
-        await closeLitbReaderAndClearArm("export failed");
+        setReaderStatus("errore durante l’esportazione; lettore lasciato aperto", "error");
+
+        if (KEEP_READER_OPEN_ON_FAILURE) {
+          stopCollectors();
+          clearArm();
+          setExportButtonBusy(false);
+        } else {
+          await closeLitbReaderAndClearArm("export failed");
+        }
       });
     }, IDLE_MS);
   }
@@ -867,12 +1407,14 @@
     performanceObserver = null;
     scrollTimer = null;
     autoScrolling = false;
+    readerAdvanceMode = "unknown";
   }
 
   function sortedRows() {
     return [...found.values()]
       .sort((a, b) => a.page - b.page)
       .map((item, index) => ({
+        dataUrl: item.dataUrl || "",
         index: index + 1,
         page: item.page === Number.MAX_SAFE_INTEGER ? "" : item.page,
         source: item.source,
@@ -932,6 +1474,26 @@
       img.onerror = reject;
       img.src = dataUrl;
     });
+  }
+
+  function imageSourceForPdf(dataUrl, img) {
+    if (/^data:image\/png[;,]/i.test(dataUrl)) {
+      return { dataUrl, format: "PNG" };
+    }
+
+    if (/^data:image\/jpe?g[;,]/i.test(dataUrl)) {
+      return { dataUrl, format: "JPEG" };
+    }
+
+    const canvas = document.createElement("canvas");
+    canvas.width = img.naturalWidth || img.width;
+    canvas.height = img.naturalHeight || img.height;
+    canvas.getContext("2d").drawImage(img, 0, 0);
+
+    return {
+      dataUrl: canvas.toDataURL("image/jpeg", 0.94),
+      format: "JPEG"
+    };
   }
 
   function pageSizeForImage(img) {
@@ -1213,15 +1775,16 @@
 
     console.log(`${LOG_PREFIX} Building PDF from ${rows.length} images...`);
     console.table(rows);
+    setReaderStatus(`creazione del PDF da ${rows.length} immagini...`);
     setExportProgressAtLeast(50);
 
     for (const row of rows) {
       try {
-        const blob = await gmRequestBlob(row.url);
+        const dataUrl = row.dataUrl || await blobToDataUrl(await gmRequestBlob(row.url));
         setExportProgressAtLeast(50 + (processed / rows.length) * 45 + 4);
-        const dataUrl = await blobToDataUrl(blob);
         const img = await loadImage(dataUrl);
         const page = pageSizeForImage(img);
+        const imageSource = imageSourceForPdf(dataUrl, img);
 
         if (!pdf) {
           pdf = new JsPdf({
@@ -1234,7 +1797,7 @@
           pdf.addPage([page.width, page.height], page.orientation);
         }
 
-        pdf.addImage(dataUrl, "JPEG", 0, 0, page.width, page.height);
+        pdf.addImage(imageSource.dataUrl, imageSource.format, 0, 0, page.width, page.height);
         added += 1;
         console.log(`${LOG_PREFIX} Added image ${added}/${rows.length}`);
       } catch (error) {
@@ -1264,6 +1827,7 @@
 
     setExportProgress(100);
     await saveBlob(pdfBlob, filename);
+    setReaderStatus(`PDF salvato: ${added} pagine`, "success");
     return true;
   }
 
@@ -1281,7 +1845,14 @@
 
     if (rows.length === 0) {
       console.warn(`${LOG_PREFIX} No valid image URLs found.`);
-      await closeLitbReaderAndClearArm("no valid image URLs");
+      setReaderStatus("nessuna immagine valida rilevata; lettore lasciato aperto", "error");
+
+      if (KEEP_READER_OPEN_ON_FAILURE) {
+        clearArm();
+      } else {
+        await closeLitbReaderAndClearArm("no valid image URLs");
+      }
+
       setExportButtonBusy(false);
       return;
     }
@@ -1290,6 +1861,14 @@
     if (created) {
       await new Promise(resolve => setTimeout(resolve, 800));
     }
+
+    if (!created && KEEP_READER_OPEN_ON_FAILURE) {
+      setReaderStatus("il PDF non è stato creato; lettore lasciato aperto", "error");
+      clearArm();
+      setExportButtonBusy(false);
+      return;
+    }
+
     await closeLitbReaderAndClearArm(created ? "PDF export finished" : "PDF was not created");
     setExportButtonBusy(false);
   }
@@ -1304,6 +1883,7 @@
 
     console.log(`${LOG_PREFIX} Reader detected:`, reason);
     console.log(`${LOG_PREFIX} Frame:`, location.href);
+    setReaderStatus("lettore rilevato; attendo la modalità di navigazione...");
 
     scanDom();
     scanPerformance();
@@ -1351,7 +1931,15 @@
     zeroLinksTimer = setTimeout(async () => {
       if (found.size === 0) {
         console.warn(`${LOG_PREFIX} Reader was detected, but no valid CloudFront images were found.`);
-        await closeLitbReaderAndClearArm("no valid CloudFront images");
+        setReaderStatus("nessuna immagine CloudFront rilevata; lettore lasciato aperto", "error");
+
+        if (KEEP_READER_OPEN_ON_FAILURE) {
+          stopCollectors();
+          clearArm();
+        } else {
+          await closeLitbReaderAndClearArm("no valid CloudFront images");
+        }
+
         setExportButtonBusy(false);
       }
     }, MAX_WAIT_WITH_ZERO_LINKS_MS);
