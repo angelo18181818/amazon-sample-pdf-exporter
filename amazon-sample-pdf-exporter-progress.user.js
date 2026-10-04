@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Amazon Sample PDF Exporter
 // @namespace    https://local.userscripts.amazon-sample-pdf-exporter
-// @version      2.10.5
+// @version      2.10.7
 // @description  Adds a luxury PDF export button with inline progress to Amazon sample pages and exports the loaded sample images as a single PDF.
 // @author       Local User
 // @license      MIT
@@ -42,7 +42,7 @@
   const PAGINATED_CAPTURE_RETRIES = 3;
   const SHOW_READER_DURING_EXPORT = false;
   const SHOW_READER_STATUS = false;
-  const KEEP_READER_OPEN_ON_FAILURE = true;
+  const KEEP_READER_OPEN_ON_FAILURE = false;
   const READER_STATUS_ID = "amazon-sample-pdf-reader-status";
 
   const VIEWER_SELECTORS = [
@@ -746,8 +746,13 @@
     return new Promise((resolve, reject) => {
       const capture = () => {
         try {
-          const width = img.naturalWidth || img.width;
-          const height = img.naturalHeight || img.height;
+          if (!img?.isConnected || !img.complete) {
+            reject(new Error("The blob image is no longer connected or loaded."));
+            return;
+          }
+
+          const width = img.naturalWidth;
+          const height = img.naturalHeight;
 
           if (!width || !height) {
             reject(new Error("The blob image has no rendered dimensions."));
@@ -771,7 +776,7 @@
         }
       };
 
-      if (img.complete && (img.naturalWidth || img.width)) {
+      if (img.isConnected && img.complete && img.naturalWidth > 0 && img.naturalHeight > 0) {
         capture();
         return;
       }
@@ -918,16 +923,27 @@
     return "waiting";
   }
 
-  function findNextPageButton() {
+  function findNextPageButton(root = document) {
     return (
-      document.querySelector("#kr-chevron-right") ||
-      document.querySelector("button[aria-label='Next page']") ||
-      document.querySelector("button[title='Next page']") ||
-      [...document.querySelectorAll("button")].find(button =>
-        /next page|pagina successiva|pagina seguente/i.test(
-          `${button.getAttribute("aria-label") || ""} ${button.title || ""}`
+      root.querySelector("#kr-chevron-right") ||
+      root.querySelector(".kr-chevron-container-right button") ||
+      root.querySelector("button.chevron.round.right") ||
+      root.querySelector("button[aria-label='Next page']") ||
+      root.querySelector("button[title='Next page']") ||
+      [...root.querySelectorAll("button, [role='button']")].find(button =>
+        /next page|pagina successiva|pagina seguente|pagina dopo|avanti/i.test(
+          `${button.getAttribute("aria-label") || ""} ${button.getAttribute("title") || ""} ${button.textContent || ""}`
         )
       )
+    );
+  }
+
+  function findNextPageContainer(root = document, button = null) {
+    return (
+      button?.closest?.(".kr-chevron-container-right, .chevron-container.right") ||
+      root.querySelector(".kr-chevron-container-right") ||
+      root.querySelector(".chevron-container.right") ||
+      root.querySelector("[class*='chevron-container-right']")
     );
   }
 
@@ -1021,20 +1037,33 @@
   function clickNextPage() {
     const pageWindow = readerPageWindow();
     const pageDocument = pageWindow.document || document;
-    const pageButton = pageDocument.getElementById("kr-chevron-right");
+    const pageButton = findNextPageButton(pageDocument);
+    const pageContainer = findNextPageContainer(pageDocument, pageButton);
+    const pageControl = pageContainer || pageButton;
 
-    if (!pageButton) {
-      throw new Error("#kr-chevron-right non trovato nel documento interno dell’iframe.");
+    if (!pageControl) {
+      const keyboardTarget =
+        pageDocument.activeElement ||
+        pageDocument.querySelector("#kr-renderer, .litb-reading-area, main") ||
+        pageDocument.body;
+      const KeyboardEventCtor = pageWindow.KeyboardEvent || KeyboardEvent;
+
+      for (const type of ["keydown", "keyup"]) {
+        keyboardTarget?.dispatchEvent(new KeyboardEventCtor(type, {
+          key: "ArrowRight",
+          code: "ArrowRight",
+          keyCode: 39,
+          which: 39,
+          bubbles: true,
+          cancelable: true,
+          view: pageWindow
+        }));
+      }
+
+      return "iframe ArrowRight fallback";
     }
 
-    const pageContainer = pageButton.closest(".kr-chevron-container-right") ||
-      pageDocument.querySelector(".kr-chevron-container-right");
-
-    if (!pageContainer) {
-      throw new Error("Il contenitore .kr-chevron-container-right non è stato trovato.");
-    }
-
-    const rect = pageContainer.getBoundingClientRect();
+    const rect = pageControl.getBoundingClientRect();
     const clientX = rect.left + rect.width / 2;
     const clientY = rect.top + rect.height / 2;
     const MouseEventCtor = pageWindow.MouseEvent || MouseEvent;
@@ -1060,18 +1089,37 @@
     });
 
     if (typeof dispatchEvent === "function") {
-      dispatchEvent.call(pageContainer, mouseDown);
-      dispatchEvent.call(pageContainer, mouseUp);
+      dispatchEvent.call(pageControl, mouseDown);
+      dispatchEvent.call(pageControl, mouseUp);
     } else {
-      pageContainer.dispatchEvent(mouseDown);
-      pageContainer.dispatchEvent(mouseUp);
+      pageControl.dispatchEvent(mouseDown);
+      pageControl.dispatchEvent(mouseUp);
     }
 
-    return "iframe right-container mousedown+mouseup";
+    if (!pageContainer && pageButton && typeof pageButton.click === "function") {
+      pageButton.click();
+    }
+
+    return pageContainer
+      ? "iframe right-container mousedown+mouseup"
+      : "iframe next-button mousedown+mouseup+click";
   }
 
   function wait(milliseconds) {
     return new Promise(resolve => setTimeout(resolve, milliseconds));
+  }
+
+  function paginatedImageSource(image) {
+    return image?.currentSrc || image?.src || image?.getAttribute?.("src") || "";
+  }
+
+  function paginatedImageIsReady(image) {
+    return Boolean(
+      image?.isConnected &&
+      image.complete &&
+      image.naturalWidth > 0 &&
+      image.naturalHeight > 0
+    );
   }
 
   function currentPaginatedImage() {
@@ -1082,14 +1130,10 @@
       ...renderer.querySelectorAll(".kg-full-page-img img, img[src^='blob:'], img")
     ];
 
-    return candidates.find(image =>
-      image.complete &&
-      (image.naturalWidth || image.width) > 0 &&
-      (image.naturalHeight || image.height) > 0
-    ) || null;
+    return candidates.find(paginatedImageIsReady) || null;
   }
 
-  async function waitForPaginatedPage(previousSignature = "") {
+  async function waitForPaginatedPage(previousSignature = "", previousImageSource = "") {
     const deadline = Date.now() + PAGINATED_PAGE_TIMEOUT_MS;
 
     while (!stopped && isExportArmed() && Date.now() < deadline) {
@@ -1099,13 +1143,44 @@
 
       const image = currentPaginatedImage();
       const signature = paginatedPageSignature();
+      const imageSource = paginatedImageSource(image);
 
-      if (image && signature && signature !== previousSignature) {
-        return {
-          end: false,
-          image,
-          signature
-        };
+      if (
+        paginatedImageIsReady(image) &&
+        imageSource &&
+        (!previousImageSource || imageSource !== previousImageSource) &&
+        signature &&
+        signature !== previousSignature
+      ) {
+        try {
+          if (typeof image.decode === "function") {
+            await image.decode();
+          }
+        } catch {
+          await wait(160);
+          continue;
+        }
+
+        await wait(160);
+
+        const stableImage = currentPaginatedImage();
+        const stableSource = paginatedImageSource(stableImage);
+        const stableSignature = paginatedPageSignature();
+
+        if (
+          paginatedImageIsReady(stableImage) &&
+          stableSource === imageSource &&
+          (!previousImageSource || stableSource !== previousImageSource) &&
+          stableSignature &&
+          stableSignature !== previousSignature
+        ) {
+          return {
+            end: false,
+            image: stableImage,
+            imageSource: stableSource,
+            signature: stableSignature
+          };
+        }
       }
 
       await wait(120);
@@ -1119,14 +1194,36 @@
 
     for (let attempt = 1; attempt <= PAGINATED_CAPTURE_RETRIES; attempt += 1) {
       try {
-        const image = currentPaginatedImage() || pageState.image;
+        const image = currentPaginatedImage();
+        if (!paginatedImageIsReady(image)) {
+          throw new Error("The current Kindle page image is not ready.");
+        }
+
+        const sourceUrl = paginatedImageSource(image);
+        if (!sourceUrl || (pageState.imageSource && sourceUrl !== pageState.imageSource)) {
+          throw new Error("The Kindle page image changed before capture.");
+        }
+
+        if (typeof image.decode === "function") {
+          await image.decode();
+        }
+
+        await wait(100);
+
+        if (
+          !paginatedImageIsReady(image) ||
+          currentPaginatedImage() !== image ||
+          paginatedImageSource(image) !== sourceUrl
+        ) {
+          throw new Error("The Kindle page image was replaced before capture.");
+        }
+
         const dataUrl = await imageElementToDataUrl(image);
 
         if (!/^data:image\//i.test(dataUrl) || dataUrl.length < 512) {
           throw new Error("The captured page image is empty.");
         }
 
-        const sourceUrl = image.currentSrc || image.src || image.getAttribute("src") || "";
         const key = `kindle-page-${pageNumber}-${pageState.signature}`;
 
         found.set(key, {
@@ -1139,7 +1236,7 @@
         setReaderStatus(`Kindle: pagina ${pageNumber} salvata`);
         setExportProgressAtLeast(Math.min(45, 16 + pageNumber * 1.5));
         extendArm();
-        return;
+        return { imageSource: sourceUrl };
       } catch (error) {
         lastError = error;
         console.warn(
@@ -1148,7 +1245,7 @@
         );
 
         if (attempt < PAGINATED_CAPTURE_RETRIES) {
-          await wait(350);
+          await wait(500);
         }
       }
     }
@@ -1158,6 +1255,7 @@
 
   async function runPaginatedReader() {
     let previousSignature = "";
+    let previousImageSource = "";
     let savedPages = 0;
     let completed = false;
 
@@ -1168,7 +1266,7 @@
           : `Kindle: attendo la pagina ${savedPages + 1}...`
       );
 
-      const pageState = await waitForPaginatedPage(previousSignature);
+      const pageState = await waitForPaginatedPage(previousSignature, previousImageSource);
 
       if (!pageState) {
         throw new Error("La pagina Kindle successiva non è comparsa entro il tempo previsto.");
@@ -1181,10 +1279,11 @@
 
       const pageNumber = savedPages + 1;
       setReaderStatus(`Kindle: salvataggio della pagina ${pageNumber}...`);
-      await saveCurrentPaginatedPage(pageState, pageNumber);
+      const savedPage = await saveCurrentPaginatedPage(pageState, pageNumber);
 
       savedPages = pageNumber;
       previousSignature = pageState.signature;
+      previousImageSource = savedPage.imageSource;
       scanPerformance();
 
       const progressPercent = sampleProgressPercent();
@@ -1199,19 +1298,17 @@
         break;
       }
 
-      const nextButton = document.querySelector("#kr-chevron-right");
+      const nextButton = findNextPageButton();
+      const nextContainer = findNextPageContainer(document, nextButton);
 
       if (paginatedEndIsVisible()) {
         completed = true;
         break;
       }
 
-      if (!nextButton) {
-        throw new Error("#kr-chevron-right è scomparso prima del 100% del sample.");
-      }
-
-      if (controlIsDisabled(nextButton)) {
-        throw new Error("#kr-chevron-right è disabilitato prima del 100% del sample.");
+      if (controlIsDisabled(nextButton) || controlIsDisabled(nextContainer)) {
+        completed = true;
+        break;
       }
 
       await wait(250);
@@ -1339,10 +1436,16 @@
             clearInterval(scrollTimer);
             scrollTimer = null;
 
-            runPaginatedReader().catch(error => {
+            runPaginatedReader().catch(async error => {
               console.error(`${LOG_PREFIX} Sequential Kindle export failed.`, error);
               stopCollectors();
-              clearArm();
+
+              if (KEEP_READER_OPEN_ON_FAILURE) {
+                clearArm();
+              } else {
+                await closeLitbReaderAndClearArm("sequential Kindle export failed");
+              }
+
               setExportButtonBusy(false);
               setReaderStatus(
                 `Kindle interrotto: ${error.message || error}`,
