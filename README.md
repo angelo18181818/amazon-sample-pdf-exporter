@@ -71,7 +71,7 @@ If the download does not start:
 
 `amazon-sample-pdf-exporter-progress.user.js`
 
-Current version: `2.10.5`
+Current version: `2.10.7`
 
 ## License
 
